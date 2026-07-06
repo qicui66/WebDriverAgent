@@ -1,0 +1,121 @@
+# ============================================================================
+# GitHub Actions Workflow: Build Custom WebDriverAgent IPA
+# ============================================================================
+# 自动注入 saveImageToCameraRoll 命令 + 编译 + 打包 IPA
+# ============================================================================
+
+name: Build Custom WDA IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # 2. 设置 Xcode
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.4'
+
+      # 3. 自动注入 saveImageToCameraRoll 命令（无需手动修改代码）
+      - name: Auto-inject saveImageToCameraRoll API
+        run: |
+          python3 << 'PYEOF'
+with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'r') as f:
+    content = f.read()
+
+# 检查是否已经注入过
+if 'handleSaveImageToCameraRoll' in content:
+    print("已注入过，跳过")
+else:
+    # 注入路由注册（在 handleSetDeviceAppearance 后面）
+    route_line = '    [[FBRoute POST:@"/wda/saveImageToCameraRoll"] respondWithTarget:self action:@selector(handleSaveImageToCameraRoll:)],'
+    old_route = '    [[FBRoute POST:@"/wda/device/appearance"].withoutSession respondWithTarget:self action:@selector(handleSetDeviceAppearance:)],'
+    content = content.replace(old_route, old_route + '\n' + route_line)
+
+    # 注入方法实现（在 @end 前面）
+    method_code = '''
+
++ (id<FBResponsePayload>)handleSaveImageToCameraRoll:(FBRouteRequest *)request
+{
+#if TARGET_OS_TV
+  return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"unsupported"
+                                                                          traceback:nil]);
+#else
+  NSString *imageDataBase64 = request.arguments[@"imageData"];
+  if (nil == imageDataBase64) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'imageData' (base64 encoded) must be provided" traceback:nil]);
+  }
+  NSData *imageData = [[NSData alloc] initWithBase64EncodedString:imageDataBase64
+                                                          options:NSDataBase64DecodingIgnoreUnknownCharacters];
+  if (nil == imageData) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot decode 'imageData' from base64" traceback:nil]);
+  }
+  UIImage *image = [UIImage imageWithData:imageData];
+  if (nil == image) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot create image from the provided data" traceback:nil]);
+  }
+  UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil);
+  return FBResponseWithOK();
+#endif
+}
+'''
+    content = content.replace('@end', method_code + '\n@end')
+
+    with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'w') as f:
+        f.write(content)
+
+    count = content.count('handleSaveImageToCameraRoll')
+    print(f"注入完成！找到 {count} 处 handleSaveImageToCameraRoll")
+PYEOF
+
+      # 4. 编译 WDA
+      - name: Build WDA
+        run: |
+          xcodebuild clean build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -derivedDataPath /tmp/wda-build \
+            -scheme WebDriverAgentRunner \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO ARCHS=arm64
+
+      # 5. 打包为 IPA（排除 XC* 系统 framework，否则安装后闪退）
+      - name: Package IPA
+        run: |
+          cd /tmp/wda-build/Build/Products/Debug-iphoneos
+          echo "=== 构建产物 ==="
+          ls -la
+          echo ""
+          APP_BUNDLE="WebDriverAgentRunner-Runner.app"
+          if [ ! -d "$APP_BUNDLE" ]; then
+            APP_BUNDLE=$(find . -maxdepth 1 -name "*.app" -type d | head -1)
+            if [ -z "$APP_BUNDLE" ]; then
+              echo "未找到 .app 包！"; ls -la; exit 1
+            fi
+          fi
+          echo "找到: $APP_BUNDLE"
+          mkdir -p Payload && cp -r "$APP_BUNDLE" Payload/
+          # 关键修复：排除 XC* 系统 framework（Appium 官方做法）
+          zip -r WDA-custom.ipa Payload/ \
+            -x "Payload/WebDriverAgentRunner-Runner.app/Frameworks/XC*.framework*" \
+               "Payload/WebDriverAgentRunner-Runner.app/Frameworks/Testing.framework*" \
+               "Payload/WebDriverAgentRunner-Runner.app/Frameworks/libXCTestSwiftSupport.dylib"
+          echo "IPA 打包完成"
+          cp WDA-custom.ipa $GITHUB_WORKSPACE/
+
+      # 6. 上传 IPA
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WDA-custom-ipa
+          path: WDA-custom.ipa
+          retention-days: 7
+          if-no-files-found: error
