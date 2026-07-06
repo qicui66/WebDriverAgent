@@ -3,19 +3,32 @@ import sys
 with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'r') as f:
     content = f.read()
 
-if 'handleSaveImageToCameraRoll' in content:
-    print('Already injected, skip')
+# 如果已有完整注入（图片+视频），跳过
+if 'handleSaveVideoToCameraRoll' in content and 'handleSaveImageToCameraRoll' in content:
+    print('Already fully injected (image+video), skip')
     sys.exit(0)
 
-# === 注入路由（图片 + 视频）===
-route_image = '    [[FBRoute POST:@"/wda/saveImageToCameraRoll"] respondWithTarget:self action:@selector(handleSaveImageToCameraRoll:)],'
-route_video = '    [[FBRoute POST:@"/wda/saveVideoToCameraRoll"] respondWithTarget:self action:@selector(handleSaveVideoToCameraRoll:)],'
-old_route = '    [[FBRoute POST:@"/wda/device/appearance"].withoutSession respondWithTarget:self action:@selector(handleSetDeviceAppearance:)],'
-content = content.replace(old_route, old_route + '\n' + route_image + '\n' + route_video)
+# 移除旧的图片单注入（如果存在但不完整）
+need_image = 'handleSaveImageToCameraRoll' not in content
+need_video = 'handleSaveVideoToCameraRoll' not in content
 
-# === 注入方法实现 ===
-method_code = """\
-+ (id<FBResponsePayload>)handleSaveImageToCameraRoll:(FBRouteRequest *)request
+print(f'Need image: {need_image}, Need video: {need_video}')
+
+# 构建要添加的路由
+new_routes = []
+if need_image:
+    new_routes.append('    [[FBRoute POST:@"/wda/saveImageToCameraRoll"] respondWithTarget:self action:@selector(handleSaveImageToCameraRoll:)],')
+if need_video:
+    new_routes.append('    [[FBRoute POST:@"/wda/saveVideoToCameraRoll"] respondWithTarget:self action:@selector(handleSaveVideoToCameraRoll:)],')
+
+# 注入路由
+old_route = '    [[FBRoute POST:@"/wda/device/appearance"].withoutSession respondWithTarget:self action:@selector(handleSetDeviceAppearance:)],'
+content = content.replace(old_route, old_route + '\n' + '\n'.join(new_routes))
+
+# 构建要添加的方法
+new_methods = []
+if need_image:
+    new_methods.append("""+ (id<FBResponsePayload>)handleSaveImageToCameraRoll:(FBRouteRequest *)request
 {
 #if TARGET_OS_TV
   return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"unsupported" traceback:nil]);
@@ -35,9 +48,10 @@ method_code = """\
   UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil);
   return FBResponseWithOK();
 #endif
-}
+}""")
 
-+ (id<FBResponsePayload>)handleSaveVideoToCameraRoll:(FBRouteRequest *)request
+if need_video:
+    new_methods.append("""+ (id<FBResponsePayload>)handleSaveVideoToCameraRoll:(FBRouteRequest *)request
 {
 #if TARGET_OS_TV
   return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"unsupported" traceback:nil]);
@@ -56,11 +70,13 @@ method_code = """\
   UISaveVideoAtPathToSavedPhotosAlbum(tempPath, nil, nil, nil);
   return FBResponseWithOK();
 #endif
-}
-"""
+}""")
+
+# 注入方法（在 @end 前）
+method_code = '\n\n' + '\n\n'.join(new_methods) + '\n'
 content = content.replace('@end', method_code + '\n@end')
 
 with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'w') as f:
     f.write(content)
 
-print('Injection done! Image + Video + CameraRoll API')
+print(f'Injection done! Image: {need_image}, Video: {need_video}')
