@@ -2,6 +2,7 @@
 # GitHub Actions Workflow: Build Custom WebDriverAgent IPA
 # ============================================================================
 # 自动注入 saveImageToCameraRoll 命令 + 编译 + 打包 IPA
+# 修复：使用 cat heredoc 避免 YAML 中的 ''' 语法问题
 # ============================================================================
 
 name: Build Custom WDA IPA
@@ -25,25 +26,27 @@ jobs:
         with:
           xcode-version: '16.4'
 
-      # 3. 自动注入 saveImageToCameraRoll 命令（无需手动修改代码）
-      - name: Auto-inject saveImageToCameraRoll API
+      # 3. 写入 Python 注入脚本（避免 YAML 管道中直接写 Python 多行字符串）
+      - name: Write inject script
         run: |
-          python3 << 'PYEOF'
-with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'r') as f:
-    content = f.read()
+          cat > inject.py << 'PYEOF'
+          import sys
 
-# 检查是否已经注入过
-if 'handleSaveImageToCameraRoll' in content:
-    print("已注入过，跳过")
-else:
-    # 注入路由注册（在 handleSetDeviceAppearance 后面）
-    route_line = '    [[FBRoute POST:@"/wda/saveImageToCameraRoll"] respondWithTarget:self action:@selector(handleSaveImageToCameraRoll:)],'
-    old_route = '    [[FBRoute POST:@"/wda/device/appearance"].withoutSession respondWithTarget:self action:@selector(handleSetDeviceAppearance:)],'
-    content = content.replace(old_route, old_route + '\n' + route_line)
+          with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'r') as f:
+              content = f.read()
 
-    # 注入方法实现（在 @end 前面）
-    method_code = '''
+          # 检查是否已经注入过
+          if 'handleSaveImageToCameraRoll' in content:
+              print('Already injected, skip')
+              sys.exit(0)
 
+          # 注入路由注册（在 handleSetDeviceAppearance 后面）
+          route_line = '    [[FBRoute POST:@"/wda/saveImageToCameraRoll"] respondWithTarget:self action:@selector(handleSaveImageToCameraRoll:)],'
+          old_route = '    [[FBRoute POST:@"/wda/device/appearance"].withoutSession respondWithTarget:self action:@selector(handleSetDeviceAppearance:)],'
+          content = content.replace(old_route, old_route + '\n' + route_line)
+
+          # 注入方法实现（在 @end 前面）
+          method_code = """
 + (id<FBResponsePayload>)handleSaveImageToCameraRoll:(FBRouteRequest *)request
 {
 #if TARGET_OS_TV
@@ -52,12 +55,12 @@ else:
 #else
   NSString *imageDataBase64 = request.arguments[@"imageData"];
   if (nil == imageDataBase64) {
-    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'imageData' (base64 encoded) must be provided" traceback:nil]);
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"imageData (base64 encoded) must be provided" traceback:nil]);
   }
   NSData *imageData = [[NSData alloc] initWithBase64EncodedString:imageDataBase64
                                                           options:NSDataBase64DecodingIgnoreUnknownCharacters];
   if (nil == imageData) {
-    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot decode 'imageData' from base64" traceback:nil]);
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot decode imageData from base64" traceback:nil]);
   }
   UIImage *image = [UIImage imageWithData:imageData];
   if (nil == image) {
@@ -67,17 +70,21 @@ else:
   return FBResponseWithOK();
 #endif
 }
-'''
-    content = content.replace('@end', method_code + '\n@end')
+"""
+          content = content.replace('@end', method_code + '\n@end')
 
-    with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'w') as f:
-        f.write(content)
+          with open('WebDriverAgentLib/Commands/FBCustomCommands.m', 'w') as f:
+              f.write(content)
 
-    count = content.count('handleSaveImageToCameraRoll')
-    print(f"注入完成！找到 {count} 处 handleSaveImageToCameraRoll")
-PYEOF
+          count = content.count('handleSaveImageToCameraRoll')
+          print(f'Injection done! Found {count} occurrence(s) of handleSaveImageToCameraRoll')
+          PYEOF
 
-      # 4. 编译 WDA
+      # 4. 运行注入脚本
+      - name: Auto-inject saveImageToCameraRoll API
+        run: python3 inject.py
+
+      # 5. 编译 WDA
       - name: Build WDA
         run: |
           xcodebuild clean build-for-testing \
@@ -87,31 +94,33 @@ PYEOF
             -destination "generic/platform=iOS" \
             CODE_SIGNING_ALLOWED=NO ARCHS=arm64
 
-      # 5. 打包为 IPA（排除 XC* 系统 framework，否则安装后闪退）
+      # 6. 打包为 IPA（排除 XC* 系统 framework，否则安装后闪退）
       - name: Package IPA
         run: |
           cd /tmp/wda-build/Build/Products/Debug-iphoneos
-          echo "=== 构建产物 ==="
+          echo "=== Build products ==="
           ls -la
           echo ""
           APP_BUNDLE="WebDriverAgentRunner-Runner.app"
           if [ ! -d "$APP_BUNDLE" ]; then
+            echo "WebDriverAgentRunner-Runner.app not found, searching..."
             APP_BUNDLE=$(find . -maxdepth 1 -name "*.app" -type d | head -1)
             if [ -z "$APP_BUNDLE" ]; then
-              echo "未找到 .app 包！"; ls -la; exit 1
+              echo "No .app bundle found!"
+              ls -la; exit 1
             fi
           fi
-          echo "找到: $APP_BUNDLE"
+          echo "Found: $APP_BUNDLE"
           mkdir -p Payload && cp -r "$APP_BUNDLE" Payload/
           # 关键修复：排除 XC* 系统 framework（Appium 官方做法）
           zip -r WDA-custom.ipa Payload/ \
             -x "Payload/WebDriverAgentRunner-Runner.app/Frameworks/XC*.framework*" \
                "Payload/WebDriverAgentRunner-Runner.app/Frameworks/Testing.framework*" \
                "Payload/WebDriverAgentRunner-Runner.app/Frameworks/libXCTestSwiftSupport.dylib"
-          echo "IPA 打包完成"
+          echo "IPA packaging done"
           cp WDA-custom.ipa $GITHUB_WORKSPACE/
 
-      # 6. 上传 IPA
+      # 7. 上传 IPA
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
