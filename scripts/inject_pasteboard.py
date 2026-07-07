@@ -37,13 +37,24 @@ pasteboard_methods = r'''+ (id<FBResponsePayload>)handleSetPasteboardText:(FBRou
   if (nil == text || ![text isKindOfClass:[NSString class]]) {
     return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"text must be a non-empty string" traceback:nil]);
   }
-  [[UIPasteboard generalPasteboard] setString:text];
-  return FBResponseWithOK();
+  // UIPasteboard MUST be accessed from the main thread
+  __block BOOL success = NO;
+  dispatch_sync(dispatch_get_main_queue(), ^{
+    [[UIPasteboard generalPasteboard] setString:text];
+    success = YES;
+  });
+  if (success) {
+    return FBResponseWithOK();
+  }
+  return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to set pasteboard" traceback:nil]);
 }
 
 + (id<FBResponsePayload>)handleGetPasteboardText:(FBRouteRequest *)request
 {
-  NSString *text = [[UIPasteboard generalPasteboard] string];
+  __block NSString *text = nil;
+  dispatch_sync(dispatch_get_main_queue(), ^{
+    text = [[UIPasteboard generalPasteboard] string];
+  });
   return FBResponseWithObject(text ?: @"");
 }'''
 
