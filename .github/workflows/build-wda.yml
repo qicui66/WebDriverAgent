@@ -15,8 +15,10 @@ jobs:
         with:
           xcode-version: '16.4'
 
-      - name: Inject saveImageToCameraRoll API
-        run: python3 scripts/inject.py
+      - name: Inject custom APIs (image, video, pasteboard)
+        run: |
+          python3 scripts/inject.py
+          python3 scripts/inject_pasteboard.py
 
       - name: Build WDA
         run: >
